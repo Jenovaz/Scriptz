@@ -73,7 +73,7 @@ function Test-TopDeckDefinition {
     <# Checks the tweak files for mistakes (missing fields, duplicate IDs, bad action types). Returns a list of problems. #>
     $problems = @()
     $seen = @{}
-    $validTypes = 'Registry', 'Service', 'ScheduledTask', 'Appx', 'Command'
+    $validTypes = 'Registry', 'RegistryKey', 'Service', 'ScheduledTask', 'Appx', 'Command'
     foreach ($t in Get-TopDeckTweak) {
         foreach ($field in 'Id', 'Name', 'Category', 'Risk', 'Description', 'Actions') {
             if (-not $t.ContainsKey($field)) { $problems += "Tweak '$($t.Id)' is missing '$field'" }
@@ -84,7 +84,8 @@ function Test-TopDeckDefinition {
         foreach ($a in @($t.Actions)) {
             if ($a.Type -notin $validTypes) { $problems += "Tweak '$($t.Id)' has unknown action type '$($a.Type)'"; continue }
             $need = switch ($a.Type) {
-                'Registry'      { 'Path', 'Name', 'Kind', 'Value' }
+                'Registry'      { if ($a.ContainsKey('Ensure')) { 'Path', 'Name' } else { 'Path', 'Name', 'Kind', 'Value' } }
+                'RegistryKey'   { 'Path', 'Ensure' }
                 'Service'       { 'Name', 'Startup' }
                 'ScheduledTask' { 'Path', 'Name' }
                 'Appx'          { 'Package' }
@@ -103,7 +104,7 @@ function Test-TopDeckDefinition {
 #region Backup store
 
 function Read-TopDeckBackup {
-    # Returns a hashtable: tweak ID -> array of per-action backup records.
+    # Returns a hashtable: tweak ID -> array of per-action backup records (@{ K = action key; B = data }).
     $store = @{}
     if (Test-Path $script:BackupFile) {
         $raw = Get-Content -Path $script:BackupFile -Raw -Encoding UTF8
@@ -117,53 +118,110 @@ function Read-TopDeckBackup {
 function Save-TopDeckBackup {
     param([hashtable]$Store)
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
-    $Store | ConvertTo-Json -Depth 8 | Set-Content -Path $script:BackupFile -Encoding UTF8
+    $Store | ConvertTo-Json -Depth 40 | Set-Content -Path $script:BackupFile -Encoding UTF8
 }
 
 #endregion
 
 #region Registry actions
+# Uses the .NET registry API directly rather than the PowerShell registry cmdlets, because the
+# cmdlets can't handle every value type (REG_NONE) or a key's unnamed "(Default)" value cleanly.
+#
+# Registry action fields:
+#   Path, Name        Name '' means the key's (Default) value
+#   Kind, Value       what to set: DWord, QWord, String, ExpandString, MultiString, Binary, None
+#   Ensure = 'Absent' instead of Kind/Value: the tweak deletes the value
+#   Default           Windows' own value, used for undo when there is no backup.
+#                     'Delete' = the value normally doesn't exist. DefaultKind if Kind isn't set.
+#
+# RegistryKey action fields: Path, Ensure = 'Absent'. Deletes a whole key; the backup is a full
+# snapshot of the key, its values and sub-keys, so undo can rebuild it exactly.
 
 function ConvertTo-RegistryValue {
     # Values read back from JSON come out as generic types; turn them back into what the registry expects.
     param($Value, [string]$Kind)
+    # The leading comma stops PowerShell unwrapping arrays: an empty or one-item array would
+    # otherwise come back as $null or a single item, and the registry would reject it.
     switch ($Kind) {
         'DWord'       { return [int]$Value }
         'QWord'       { return [long]$Value }
-        'Binary'      { return [byte[]]@($Value) }
-        'MultiString' { return [string[]]@($Value) }
+        'Binary'      { return , [byte[]]@($Value) }
+        'None'        { return , [byte[]]@($Value) }
+        'MultiString' { return , [string[]]@($Value) }
         default       { return [string]$Value }
     }
 }
 
+function Split-RegistryPath {
+    param([string]$Path)
+    $hive, $sub = $Path -split ':\\', 2
+    $root = switch ($hive) {
+        'HKLM' { [Microsoft.Win32.Registry]::LocalMachine }
+        'HKCU' { [Microsoft.Win32.Registry]::CurrentUser }
+        'HKCR' { [Microsoft.Win32.Registry]::ClassesRoot }
+        'HKU'  { [Microsoft.Win32.Registry]::Users }
+        default { throw "Unsupported registry hive in '$Path'" }
+    }
+    return @{ Root = $root; Sub = [string]$sub }
+}
+
+function Open-RegistryKey {
+    # Returns the opened key, or $null if it doesn't exist (and -Create wasn't asked for). Caller must Close() it.
+    param([string]$Path, [switch]$Writable, [switch]$Create)
+    $p = Split-RegistryPath $Path
+    if ($Create) { return $p.Root.CreateSubKey($p.Sub) }
+    return $p.Root.OpenSubKey($p.Sub, [bool]$Writable)
+}
+
+function Test-RegistryKeyExists {
+    param([string]$Path)
+    $k = Open-RegistryKey $Path
+    if ($k) { $k.Close(); return $true }
+    return $false
+}
+
 function Get-RegistryState {
     param([string]$Path, [string]$Name)
-    if (-not (Test-Path $Path)) { return @{ Exists = $false } }
-    $key = Get-Item -Path $Path
-    if ($key.GetValueNames() -notcontains $Name) { return @{ Exists = $false } }
-    return @{
-        Exists = $true
-        Value  = $key.GetValue($Name, $null, 'DoNotExpandEnvironmentNames')
-        Kind   = $key.GetValueKind($Name).ToString()
-    }
+    $key = Open-RegistryKey $Path
+    if (-not $key) { return @{ Exists = $false } }
+    try {
+        if ($key.GetValueNames() -notcontains $Name) { return @{ Exists = $false } }
+        return @{
+            Exists = $true
+            Value  = $key.GetValue($Name, $null, 'DoNotExpandEnvironmentNames')
+            Kind   = $key.GetValueKind($Name).ToString()
+        }
+    } finally { $key.Close() }
 }
 
 function Set-RegistryState {
     param([string]$Path, [string]$Name, $Value, [string]$Kind)
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    New-ItemProperty -Path $Path -Name $Name -Value (ConvertTo-RegistryValue $Value $Kind) -PropertyType $Kind -Force | Out-Null
+    $key = Open-RegistryKey $Path -Create
+    try { $key.SetValue($Name, (ConvertTo-RegistryValue $Value $Kind), [Microsoft.Win32.RegistryValueKind]$Kind) }
+    finally { $key.Close() }
 }
 
 function Remove-RegistryState {
     param([string]$Path, [string]$Name)
-    if (Test-Path $Path) { Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue }
+    $key = Open-RegistryKey $Path -Writable
+    if ($key) { try { $key.DeleteValue($Name, $false) } finally { $key.Close() } }
+}
+
+function Test-IsAbsentAction { param([hashtable]$A) $A.ContainsKey('Ensure') -and $A.Ensure -eq 'Absent' }
+
+function Format-RegistryValue {
+    param($Value)
+    $text = @($Value) -join ','
+    if ($text.Length -gt 60) { $text = $text.Substring(0, 57) + '...' }
+    return $text
 }
 
 function Test-RegistryAction {
     param([hashtable]$A)
     $s = Get-RegistryState $A.Path $A.Name
+    if (Test-IsAbsentAction $A) { return -not $s.Exists }
     if (-not $s.Exists) { return $false }
-    if ($A.Kind -in 'Binary', 'MultiString') { return (@($s.Value) -join ',') -eq (@($A.Value) -join ',') }
+    if ($A.Kind -in 'Binary', 'None', 'MultiString') { return (@($s.Value) -join ',') -eq (@($A.Value) -join ',') }
     return [string](ConvertTo-RegistryValue $s.Value $A.Kind) -eq [string](ConvertTo-RegistryValue $A.Value $A.Kind)
 }
 
@@ -174,7 +232,11 @@ function Backup-RegistryAction {
     return @{ Existed = $false }
 }
 
-function Invoke-RegistryAction { param([hashtable]$A) Set-RegistryState $A.Path $A.Name $A.Value $A.Kind }
+function Invoke-RegistryAction {
+    param([hashtable]$A)
+    if (Test-IsAbsentAction $A) { Remove-RegistryState $A.Path $A.Name }
+    else { Set-RegistryState $A.Path $A.Name $A.Value $A.Kind }
+}
 
 function Undo-RegistryAction {
     param([hashtable]$A, $Backup)
@@ -183,16 +245,81 @@ function Undo-RegistryAction {
         else { Remove-RegistryState $A.Path $A.Name }
         return
     }
-    # No backup (tweak was applied by something else): fall back to the Windows default in the definition.
-    if (-not $A.ContainsKey('Default') -or $A.Default -eq 'Delete') { Remove-RegistryState $A.Path $A.Name }
-    else { Set-RegistryState $A.Path $A.Name $A.Default $A.Kind }
+    # No backup: the tweak was applied by something else. Use the Windows default if the definition has one.
+    if ($A.ContainsKey('Default')) {
+        if ($A.Default -eq 'Delete') { Remove-RegistryState $A.Path $A.Name; return }
+        $kind = if ($A.ContainsKey('DefaultKind')) { $A.DefaultKind } else { $A.Kind }
+        Set-RegistryState $A.Path $A.Name $A.Default $kind
+        return
+    }
+    # Group Policy values don't exist on a fresh Windows install, so deleting them is the true default.
+    if ($A.Path -match '\\Policies\\' -and -not (Test-IsAbsentAction $A)) { Remove-RegistryState $A.Path $A.Name; return }
+    Write-TopDeckLog "  No saved original for $($A.Path)\$($A.Name); left as it is." 'Warn'
 }
 
 function Get-RegistryDescription {
     param([hashtable]$A)
     $s = Get-RegistryState $A.Path $A.Name
-    $now = if ($s.Exists) { @($s.Value) -join ',' } else { '(not set)' }
-    return 'Registry  {0}\{1}: {2} -> {3}' -f $A.Path, $A.Name, $now, (@($A.Value) -join ',')
+    $now = if ($s.Exists) { Format-RegistryValue $s.Value } else { '(not set)' }
+    $target = if (Test-IsAbsentAction $A) { '(delete)' } else { Format-RegistryValue $A.Value }
+    $label = if ($A.Name) { $A.Name } else { '(Default)' }
+    return 'Registry  {0}\{1}: {2} -> {3}' -f $A.Path, $label, $now, $target
+}
+
+function Get-RegistryKeySnapshot {
+    # Everything under a key, as plain data that survives a round trip through JSON.
+    param($Key)   # a Microsoft.Win32.RegistryKey (untyped so tests can pass a stand-in)
+    $values = @()
+    foreach ($n in $Key.GetValueNames()) {
+        $values += @{ Name = $n; Kind = $Key.GetValueKind($n).ToString(); Value = $Key.GetValue($n, $null, 'DoNotExpandEnvironmentNames') }
+    }
+    $subs = @{}
+    foreach ($n in $Key.GetSubKeyNames()) {
+        $child = $Key.OpenSubKey($n)
+        if ($child) { try { $subs[$n] = Get-RegistryKeySnapshot $child } finally { $child.Close() } }
+    }
+    return @{ Values = $values; Keys = $subs }
+}
+
+function Restore-RegistryKeySnapshot {
+    param([string]$Path, $Snapshot)
+    $key = Open-RegistryKey $Path -Create
+    try {
+        foreach ($v in @($Snapshot.Values)) {
+            if ($v) { $key.SetValue([string]$v.Name, (ConvertTo-RegistryValue $v.Value $v.Kind), [Microsoft.Win32.RegistryValueKind]$v.Kind) }
+        }
+    } finally { $key.Close() }
+    # Sub-keys are a hashtable when fresh, or an object when read back from the backup file.
+    $subs = $Snapshot.Keys
+    $pairs = if ($subs -is [hashtable]) { $subs.GetEnumerator() } elseif ($subs) { $subs.PSObject.Properties } else { @() }
+    foreach ($pair in $pairs) { Restore-RegistryKeySnapshot "$Path\$($pair.Name)" $pair.Value }
+}
+
+function Test-RegistryKeyAction { param([hashtable]$A) -not (Test-RegistryKeyExists $A.Path) }
+
+function Backup-RegistryKeyAction {
+    param([hashtable]$A)
+    $key = Open-RegistryKey $A.Path
+    if (-not $key) { return @{ Existed = $false } }
+    try { return @{ Existed = $true; Snapshot = Get-RegistryKeySnapshot $key } } finally { $key.Close() }
+}
+
+function Invoke-RegistryKeyAction {
+    param([hashtable]$A)
+    $p = Split-RegistryPath $A.Path
+    $p.Root.DeleteSubKeyTree($p.Sub, $false)
+}
+
+function Undo-RegistryKeyAction {
+    param([hashtable]$A, $Backup)
+    if ($Backup -and $Backup.Existed) { Restore-RegistryKeySnapshot $A.Path $Backup.Snapshot }
+    elseif (-not $Backup) { Write-TopDeckLog "  No saved copy of $($A.Path); it can't be rebuilt." 'Warn' }
+}
+
+function Get-RegistryKeyDescription {
+    param([hashtable]$A)
+    if (Test-RegistryKeyExists $A.Path) { return "Registry  delete key $($A.Path) (a full copy is saved first)" }
+    return "Registry  key $($A.Path): already gone"
 }
 
 #endregion
@@ -361,6 +488,7 @@ function Get-CommandDescription { param([hashtable]$A) "Command   $($A.Describe)
 
 $script:Handlers = @{
     Registry      = @{ Test = 'Test-RegistryAction'; Backup = 'Backup-RegistryAction'; Apply = 'Invoke-RegistryAction'; Revert = 'Undo-RegistryAction'; Describe = 'Get-RegistryDescription' }
+    RegistryKey   = @{ Test = 'Test-RegistryKeyAction'; Backup = 'Backup-RegistryKeyAction'; Apply = 'Invoke-RegistryKeyAction'; Revert = 'Undo-RegistryKeyAction'; Describe = 'Get-RegistryKeyDescription' }
     Service       = @{ Test = 'Test-ServiceAction';  Backup = 'Backup-ServiceAction';  Apply = 'Invoke-ServiceAction';  Revert = 'Undo-ServiceAction';  Describe = 'Get-ServiceDescription' }
     ScheduledTask = @{ Test = 'Test-TaskAction';     Backup = 'Backup-TaskAction';     Apply = 'Invoke-TaskAction';     Revert = 'Undo-TaskAction';     Describe = 'Get-TaskDescription' }
     Appx          = @{ Test = 'Test-AppxAction';     Backup = 'Backup-AppxAction';     Apply = 'Invoke-AppxAction';     Revert = 'Undo-AppxAction';     Describe = 'Get-AppxDescription' }
@@ -419,17 +547,47 @@ function Get-TopDeckPreview {
     return $lines
 }
 
+function Get-ActionKey {
+    # Identifies an action by what it touches, so backups still match after a tweak's action list is edited.
+    param([hashtable]$A)
+    $parts = switch ($A.Type) {
+        'Registry'      { $A.Path, $A.Name }
+        'RegistryKey'   { $A.Path }
+        'Service'       { $A.Name }
+        'ScheduledTask' { $A.Path, $A.Name }
+        'Appx'          { $A.Package }
+        'Command'       { $A.Describe }
+    }
+    return (@($A.Type) + @($parts) -join '|').ToLowerInvariant()
+}
+
+function Find-BackupRecord {
+    # Records are @{ K = action key; B = backup data }. Older backups were a plain list in action order.
+    param($Records, [hashtable]$Action, [int]$Index)
+    $key = Get-ActionKey $Action
+    foreach ($r in @($Records)) {
+        if ($r -and $r.PSObject.Properties['K'] -and $r.K -eq $key) { return @{ Found = $true; Data = $r.B } }
+        if ($r -is [hashtable] -and $r.ContainsKey('K') -and $r.K -eq $key) { return @{ Found = $true; Data = $r.B } }
+    }
+    $list = @()
+    if ($null -ne $Records) { $list = @($Records) }   # keep null entries: old backups are matched by position
+    $anyKeyed = @($list | Where-Object { $_ -and ($_.PSObject.Properties['K'] -or ($_ -is [hashtable] -and $_.ContainsKey('K'))) }).Count
+    if (-not $anyKeyed -and $Index -lt $list.Count) { return @{ Found = $true; Data = $list[$Index] } }
+    return @{ Found = $false; Data = $null }
+}
+
 function Invoke-TopDeckPlan {
     <#
     Runs a plan: hashtable of tweak ID -> 'Apply' or 'Revert'.
-    Apply: saves originals (first time only), then applies each action.
+    Apply: saves the original of each setting (first time only), then applies each action.
     Revert: restores originals in reverse order, then forgets the backup.
     One failing action is logged and the rest carry on.
-    Returns @{ Reboot = $true/$false; Failed = <count> }.
+    Returns @{ Reboot; Explorer; Failed }.
     #>
     param([Parameter(Mandatory)][hashtable]$Plan)
     $backups = Read-TopDeckBackup
     $reboot = $false
+    $explorer = $false
     $failed = 0
 
     foreach ($t in Get-TopDeckTweak -Id @($Plan.Keys)) {
@@ -439,22 +597,27 @@ function Invoke-TopDeckPlan {
         $failedBefore = $failed
 
         if ($op -eq 'Apply') {
-            if (-not $backups.ContainsKey($t.Id)) {
-                $records = @()
-                foreach ($a in $actions) {
-                    try { $records += , (Invoke-ActionStep $a 'Backup') } catch { $records += , $null }
-                }
-                $backups[$t.Id] = $records
-                Save-TopDeckBackup $backups
+            # Back up any setting that has no saved original yet. Existing originals are never overwritten.
+            # @() around the whole 'if': an if/else that yields an empty array otherwise gives $null.
+            $records = @(if ($backups.ContainsKey($t.Id)) { $backups[$t.Id] })
+            $changed = $false
+            for ($i = 0; $i -lt $actions.Count; $i++) {
+                if ((Find-BackupRecord $records $actions[$i] $i).Found) { continue }
+                $data = $null
+                try { $data = Invoke-ActionStep $actions[$i] 'Backup' } catch { }   # unreadable: undo falls back to the default
+                $records += , @{ K = Get-ActionKey $actions[$i]; B = $data }
+                $changed = $true
             }
+            if ($changed) { $backups[$t.Id] = $records; Save-TopDeckBackup $backups }
             foreach ($a in $actions) {
                 try { Invoke-ActionStep $a 'Apply' | Out-Null }
                 catch { $failed++; Write-TopDeckLog "  $($a.Type) failed: $($_.Exception.Message)" 'Error' }
             }
         } else {
-            $records = if ($backups.ContainsKey($t.Id)) { @($backups[$t.Id]) } else { @() }
+            # @() around the whole 'if': an if/else that yields an empty array otherwise gives $null.
+            $records = @(if ($backups.ContainsKey($t.Id)) { $backups[$t.Id] })
             for ($i = $actions.Count - 1; $i -ge 0; $i--) {
-                $b = if ($i -lt $records.Count) { $records[$i] } else { $null }
+                $b = (Find-BackupRecord $records $actions[$i] $i).Data
                 try { Invoke-ActionStep $actions[$i] 'Revert' $b | Out-Null }
                 catch { $failed++; Write-TopDeckLog "  $($actions[$i].Type) revert failed: $($_.Exception.Message)" 'Error' }
             }
@@ -463,9 +626,24 @@ function Invoke-TopDeckPlan {
         }
 
         if ($t.ContainsKey('Reboot') -and $t.Reboot) { $reboot = $true }
+        if ($t.ContainsKey('Explorer') -and $t.Explorer) { $explorer = $true }
         if ($failed -eq $failedBefore) { Write-TopDeckLog '  done' 'Ok' } else { Write-TopDeckLog '  finished with errors' 'Warn' }
     }
-    return @{ Reboot = $reboot; Failed = $failed }
+    return @{ Reboot = $reboot; Explorer = $explorer; Failed = $failed }
+}
+
+function Restart-TopDeckExplorer {
+    <# Restarts File Explorer so taskbar, Start and Explorer changes show without signing out. #>
+    Write-TopDeckLog 'Restarting File Explorer...'
+    Get-Process -Name explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+    # Windows restarts the shell itself as the normal (non-admin) user. Starting it from here would
+    # run the whole desktop as admin, so only do that if Windows hasn't brought it back in 10 seconds.
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) { Write-TopDeckLog 'File Explorer restarted' 'Ok'; return }
+    }
+    Start-Process explorer.exe
+    Write-TopDeckLog 'File Explorer was started by Top Deck. Sign out and back in if anything looks odd.' 'Warn'
 }
 
 function Invoke-TopDeckTool {
@@ -532,4 +710,4 @@ function Import-TopDeckProfile {
 
 Export-ModuleMember -Function Set-TopDeckLogSink, Write-TopDeckLog, Get-TopDeckTweak, Get-TopDeckTool,
     Test-TopDeckDefinition, Get-TopDeckTweakState, Get-TopDeckState, Get-TopDeckPreview, Invoke-TopDeckPlan,
-    Invoke-TopDeckTool, New-TopDeckRestorePoint, Export-TopDeckProfile, Import-TopDeckProfile, Read-TopDeckBackup
+    Invoke-TopDeckTool, Restart-TopDeckExplorer, New-TopDeckRestorePoint, Export-TopDeckProfile, Import-TopDeckProfile, Read-TopDeckBackup

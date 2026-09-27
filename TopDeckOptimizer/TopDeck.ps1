@@ -64,7 +64,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 [xml]$xaml = Get-Content -Path (Join-Path $root 'Core\MainWindow.xaml') -Raw
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
-foreach ($name in 'NavList', 'ContentHost', 'LogBox', 'StatusText', 'HeaderSub', 'ChkRestorePoint',
+foreach ($name in 'NavList', 'ContentHost', 'SearchBox', 'SearchHint', 'LogBox', 'StatusText', 'HeaderSub', 'ChkRestorePoint',
     'BtnRecommended', 'BtnUndoAll', 'BtnReset', 'BtnLoadProfile', 'BtnSaveProfile', 'BtnPreview', 'BtnApply') {
     $ui[$name] = $window.FindName($name)
 }
@@ -72,13 +72,22 @@ foreach ($name in 'NavList', 'ContentHost', 'LogBox', 'StatusText', 'HeaderSub',
 function New-Brush([string]$Hex) { New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($Hex)) }
 
 $riskColour = @{ Safe = '#22C55E'; Moderate = '#F59E0B'; Advanced = '#EF4444' }
+# Tabs appear in this order; any category not listed goes at the end.
+$categoryOrder = 'Privacy', 'App Permissions', 'Debloat', 'Performance', 'Gaming', 'Start & Taskbar', 'File Explorer',
+    'Desktop & Look', 'Accessibility & Input', 'System', 'Security', 'Tools'
 $categoryBlurb = @{
-    Privacy     = 'Stop Windows sending data about you and showing you ads.'
-    Debloat     = 'Remove built-in apps and features you do not use.'
-    Performance = 'Make Windows start and respond faster.'
-    Gaming      = 'Lower input lag and get steadier frame rates.'
-    Interface   = 'Small changes that make Windows nicer to use.'
-    Tools       = 'One-off clean-up and repair jobs. These run straight away when you press Run.'
+    'Privacy'               = 'Stop Windows sending data about you and showing you ads.'
+    'App Permissions'       = 'Choose what Store apps can reach. Desktop programs (Steam, Discord, browsers) are not affected.'
+    'Debloat'               = 'Remove built-in apps and features you do not use.'
+    'Performance'           = 'Make Windows start and respond faster.'
+    'Gaming'                = 'Lower input lag and get steadier frame rates.'
+    'Start & Taskbar'       = 'Clean up the Start menu and taskbar. Explorer restarts to show changes.'
+    'File Explorer'         = 'Make File Explorer faster and less cluttered.'
+    'Desktop & Look'        = 'How Windows looks and sounds. Personal taste - none of these change speed much.'
+    'Accessibility & Input' = 'Stop keyboard shortcuts and pop-ups that interrupt games.'
+    'System'                = 'Windows behaviour behind the scenes: updates, drivers, maintenance.'
+    'Security'              = 'Each of these turns a Windows protection OFF. Only use them if you know exactly why you need to.'
+    'Tools'                 = 'One-off clean-up and repair jobs. These run straight away when you press Run.'
 }
 
 #endregion
@@ -152,7 +161,8 @@ function Set-Busy([bool]$Busy, [string]$Status = '') {
 
 $tweaks = @(Get-TopDeckTweak)
 $tools  = @(Get-TopDeckTool)
-$rows = @{}           # tweak ID -> @{ Tweak; Check; Status; State }
+$rows = @{}           # tweak ID -> @{ Tweak; Check; Status; State; Card }
+$searchIndex = @()    # every card with the text search looks in
 $panels = [ordered]@{}  # category -> StackPanel
 $script:loadingState = $true
 
@@ -216,7 +226,8 @@ foreach ($t in $tweaks) {
     [void]$card.Child.Children.Add($left)
     [void]$card.Child.Children.Add($check)
     [void]$panels[$t.Category].Children.Add($card)
-    $rows[$t.Id] = @{ Tweak = $t; Check = $check; Status = $status; State = 'NotApplied' }
+    $rows[$t.Id] = @{ Tweak = $t; Check = $check; Status = $status; State = 'NotApplied'; Card = $card }
+    $searchIndex += , @{ Card = $card; Category = $t.Category; Text = ('{0} {1} {2} {3}' -f $t.Name, $t.Description, $t.Id, $t.Risk).ToLowerInvariant() }
 }
 
 # Tools tab
@@ -246,11 +257,68 @@ foreach ($tool in $tools) {
     [void]$card.Child.Children.Add($left)
     [void]$card.Child.Children.Add($run)
     [void]$toolPanel.Children.Add($card)
+    $searchIndex += , @{ Card = $card; Category = 'Tools'; Text = ('{0} {1}' -f $tool.Name, $tool.Description).ToLowerInvariant() }
 }
 $panels['Tools'] = $toolPanel
 
-foreach ($c in $panels.Keys) { [void]$ui.NavList.Items.Add($c) }
-$ui.NavList.Add_SelectionChanged({ $ui.ContentHost.Content = $panels[[string]$ui.NavList.SelectedItem] })
+# All category panels live in one column; the tab list and the search box just show or hide them.
+$allPanel = New-Object Windows.Controls.StackPanel
+$ordered = @($categoryOrder | Where-Object { $panels.Contains($_) }) + @($panels.Keys | Where-Object { $categoryOrder -notcontains $_ })
+foreach ($c in $ordered) {
+    [void]$allPanel.Children.Add($panels[$c])
+    $count = if ($c -eq 'Tools') { $tools.Count } else { @($tweaks | Where-Object { $_.Category -eq $c }).Count }
+    $item = New-Object Windows.Controls.ListBoxItem
+    $item.Content = "$c  ($count)"; $item.Tag = $c
+    [void]$ui.NavList.Items.Add($item)
+}
+$ui.ContentHost.Content = $allPanel
+
+function Show-Category([string]$Category) {
+    foreach ($c in $panels.Keys) {
+        $panels[$c].Visibility = if ($c -eq $Category) { 'Visible' } else { 'Collapsed' }
+        $panels[$c].Margin = '0'
+    }
+    foreach ($entry in $searchIndex) { $entry.Card.Visibility = 'Visible' }
+    $ui.ContentHost.ScrollToTop()
+    Update-Pending   # puts the normal status line back after a search
+}
+
+function Show-SearchResult([string]$Text) {
+    # Shows every card whose name or description contains all the typed words, across all tabs.
+    $words = @($Text.ToLowerInvariant() -split '\s+' | Where-Object { $_ })
+    $hits = @{}
+    foreach ($entry in $searchIndex) {
+        $match = $true
+        foreach ($w in $words) { if (-not $entry.Text.Contains($w)) { $match = $false; break } }
+        $entry.Card.Visibility = if ($match) { 'Visible' } else { 'Collapsed' }
+        if ($match) { $hits[$entry.Category] = $true }
+    }
+    foreach ($c in $panels.Keys) {
+        $panels[$c].Visibility = if ($hits.ContainsKey($c)) { 'Visible' } else { 'Collapsed' }
+        $panels[$c].Margin = '0,0,0,18'
+    }
+    $ui.StatusText.Text = if ($hits.Count) { "Showing matches for '$Text'." } else { "Nothing matches '$Text'." }
+    $ui.ContentHost.ScrollToTop()
+}
+
+$script:navFromSearch = $false
+$ui.NavList.Add_SelectionChanged({
+    if ($script:navFromSearch -or -not $ui.NavList.SelectedItem) { return }
+    if ($ui.SearchBox.Text) { $ui.SearchBox.Text = '' }
+    Show-Category ([string]$ui.NavList.SelectedItem.Tag)
+})
+$ui.SearchBox.Add_TextChanged({
+    $text = $ui.SearchBox.Text.Trim()
+    $ui.SearchHint.Visibility = if ($ui.SearchBox.Text) { 'Collapsed' } else { 'Visible' }
+    if ($text) {
+        $script:navFromSearch = $true
+        $ui.NavList.SelectedIndex = -1
+        $script:navFromSearch = $false
+        Show-SearchResult $text
+    } elseif ($ui.NavList.SelectedIndex -lt 0) {
+        $ui.NavList.SelectedIndex = 0
+    }
+})
 $ui.NavList.SelectedIndex = 0
 
 #endregion
@@ -388,7 +456,10 @@ $ui.BtnApply.Add_Click({
             if ($r -and $r.Reboot) {
                 [void][Windows.MessageBox]::Show($window, 'Some changes need a restart (or sign out and back in) to take effect.', 'Restart needed', 'OK', 'Information')
             }
-            Update-State
+            $restart = $r -and $r.Explorer -and
+                [Windows.MessageBox]::Show($window, "Restart File Explorer now so the taskbar, Start and Explorer changes show?`n`nThe taskbar disappears for a couple of seconds. Open Explorer windows will close.", 'Restart Explorer', 'YesNo', 'Question') -eq 'Yes'
+            if ($restart) { Start-TopDeckJob -Script 'Restart-TopDeckExplorer' -Status 'Restarting File Explorer...' -OnDone { Update-State } }
+            else { Update-State }
         }
     }
 
