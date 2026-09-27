@@ -3,44 +3,11 @@ One-shot tools: buttons on the Tools tab that do a job once (clean, repair), rat
 Each Run script's output lines are written to the log.
 
 Fields: Id, Name, Description, Duration (rough guide shown on the button), Run.
+Confirm (optional): a warning shown in a Yes/No box before the tool runs.
+File cleanup lives in Cleanup.ps1 (the Cleanup tab), not here.
 #>
 
 @(
-    @{
-        Id = 'tool.clean-temp'; Name = 'Clean temporary files'; Duration = 'Under a minute'
-        Description = 'Deletes leftover temp files from your user folder and Windows. Files still in use are skipped.'
-        Run = {
-            # Prefetch is deliberately left alone: Windows rebuilds it and apps launch slower meanwhile.
-            $folders = @($env:TEMP, "$env:SystemRoot\Temp") | Select-Object -Unique
-            $freed = 0
-            foreach ($folder in $folders) {
-                if (-not (Test-Path $folder)) { continue }
-                foreach ($item in Get-ChildItem -Path $folder -Recurse -Force -File -ErrorAction SilentlyContinue) {
-                    try {
-                        $size = $item.Length
-                        Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
-                        $freed += $size
-                    } catch { }   # file in use: skip it
-                }
-                # Remove folders left empty, deepest first. Only empty ones: Remove-Item on a folder that
-                # still has files would stop and ask "are you sure?", which hangs a background job.
-                Get-ChildItem -Path $folder -Recurse -Force -Directory -ErrorAction SilentlyContinue |
-                    Sort-Object { $_.FullName.Length } -Descending |
-                    Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue) } |
-                    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-                "Cleaned $folder"
-            }
-            'Freed {0:N0} MB' -f ($freed / 1MB)
-        }
-    }
-    @{
-        Id = 'tool.recycle-bin'; Name = 'Empty the Recycle Bin'; Duration = 'Seconds'
-        Description = 'Permanently deletes everything in the Recycle Bin on all drives.'
-        Run = {
-            Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-            'Recycle Bin emptied'
-        }
-    }
     @{
         Id = 'tool.flush-dns'; Name = 'Flush DNS cache'; Duration = 'Seconds'
         Description = 'Clears saved website addresses. Fixes "site not found" after a site moves or your network changes.'
@@ -74,5 +41,56 @@ Fields: Id, Name, Description, Duration (rough guide shown on the button), Run.
         Id = 'tool.component-cleanup'; Name = 'Clean up old Windows updates'; Duration = '5-15 minutes'
         Description = 'Removes superseded update files from the component store (WinSxS). Frees space; installed updates can still be uninstalled.'
         Run = { & dism.exe /Online /Cleanup-Image /StartComponentCleanup }
+    }
+    @{
+        Id = 'tool.chkdsk'; Name = 'Check the system drive for errors'; Duration = 'A few minutes'
+        Description = 'Scans the Windows drive for file system errors while you keep working (chkdsk /scan). Tells you if a repair at restart is needed.'
+        Run = { & chkdsk.exe $env:SystemDrive /scan }
+    }
+    @{
+        Id = 'tool.icon-cache'; Name = 'Rebuild the icon cache'; Duration = 'Seconds'
+        Description = 'Fixes blank or wrong icons on the desktop, taskbar and in Explorer.'
+        Run = {
+            & ie4uinit.exe -show
+            'Icon cache refreshed. If icons still look wrong, sign out and back in.'
+        }
+    }
+    @{
+        Id = 'tool.store-reset'; Name = 'Reset the Microsoft Store cache'; Duration = 'Under a minute'
+        Description = 'Fixes Store downloads that are stuck or will not start. The Store opens by itself when finished.'
+        Run = {
+            Start-Process -FilePath "$env:SystemRoot\System32\wsreset.exe"
+            'Store cache reset started. Wait for the Store to open.'
+        }
+    }
+    @{
+        Id = 'tool.network-reset'; Name = 'Reset the network stack'; Duration = 'Seconds, then restart'
+        Description = 'Fixes "connected but no internet" and broken DNS by resetting Winsock and TCP/IP. Needs a restart.'
+        Confirm = "This resets Winsock and TCP/IP settings.`n`nAny static IP address you typed in by hand is removed, and some VPN software may need reinstalling. A restart is needed afterwards.`n`nContinue?"
+        Run = {
+            & netsh.exe winsock reset
+            & netsh.exe int ip reset
+            & ipconfig.exe /flushdns
+            'Done. Restart the PC to finish the reset.'
+        }
+    }
+    @{
+        Id = 'tool.update-reset'; Name = 'Reset Windows Update'; Duration = 'Under a minute'
+        Description = 'Fixes updates that fail or stay stuck by clearing Windows Update''s working folders. Update history in Settings will look empty afterwards; installed updates are not affected.'
+        Confirm = "This stops Windows Update, renames its working folders (SoftwareDistribution and catroot2) to .old, and starts it again.`n`nDo not use it while an update is installing. Continue?"
+        Run = {
+            $services = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
+            Stop-Service -Name $services -Force -ErrorAction SilentlyContinue
+            foreach ($dir in "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2") {
+                $old = "$dir.old"
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $dir) {
+                    try { Rename-Item -LiteralPath $dir -NewName (Split-Path $old -Leaf) -ErrorAction Stop; "Renamed $dir" }
+                    catch { "Could not rename $dir (in use): $($_.Exception.Message)" }
+                }
+            }
+            Start-Service -Name $services -ErrorAction SilentlyContinue
+            'Windows Update reset. Check for updates again in Settings.'
+        }
     }
 )

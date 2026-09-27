@@ -74,7 +74,7 @@ function New-Brush([string]$Hex) { New-Object Windows.Media.SolidColorBrush ([Wi
 $riskColour = @{ Safe = '#22C55E'; Moderate = '#F59E0B'; Advanced = '#EF4444' }
 # Tabs appear in this order; any category not listed goes at the end.
 $categoryOrder = 'Privacy', 'App Permissions', 'Debloat', 'Performance', 'Gaming', 'Start & Taskbar', 'File Explorer',
-    'Desktop & Look', 'Accessibility & Input', 'System', 'Security', 'Tools'
+    'Desktop & Look', 'Accessibility & Input', 'System', 'Security', 'Cleanup', 'Tools'
 $categoryBlurb = @{
     'Privacy'               = 'Stop Windows sending data about you and showing you ads.'
     'App Permissions'       = 'Choose what Store apps can reach. Desktop programs (Steam, Discord, browsers) are not affected.'
@@ -87,7 +87,8 @@ $categoryBlurb = @{
     'Accessibility & Input' = 'Stop keyboard shortcuts and pop-ups that interrupt games.'
     'System'                = 'Windows behaviour behind the scenes: updates, drivers, maintenance.'
     'Security'              = 'Each of these turns a Windows protection OFF. Only use them if you know exactly why you need to.'
-    'Tools'                 = 'One-off clean-up and repair jobs. These run straight away when you press Run.'
+    'Cleanup'               = 'Free up disk space. Press Scan to see how much each item holds, tick what to remove, then Clean.'
+    'Tools'                 = 'One-off repair and maintenance jobs. These run straight away when you press Run.'
 }
 
 #endregion
@@ -152,6 +153,7 @@ function Set-Busy([bool]$Busy, [string]$Status = '') {
         $ui[$b].IsEnabled = -not $Busy
     }
     $ui.ContentHost.IsEnabled = -not $Busy
+    if (Get-Variable -Name btnScan -Scope Script -ErrorAction SilentlyContinue) { Update-CleanTotal }
     if ($Busy) { $ui.StatusText.Text = $Status } else { Update-Pending }
 }
 
@@ -161,6 +163,7 @@ function Set-Busy([bool]$Busy, [string]$Status = '') {
 
 $tweaks = @(Get-TopDeckTweak)
 $tools  = @(Get-TopDeckTool)
+$cleanItems = @(Get-TopDeckCleanupItem)
 $rows = @{}           # tweak ID -> @{ Tweak; Check; Status; State; Card }
 $searchIndex = @()    # every card with the text search looks in
 $panels = [ordered]@{}  # category -> StackPanel
@@ -250,6 +253,9 @@ foreach ($tool in $tools) {
     $run.Content = 'Run'; $run.Tag = $tool.Id; $run.VerticalAlignment = 'Center'
     $run.Add_Click({
         param($source)
+        $tool = $tools | Where-Object { $_.Id -eq $source.Tag } | Select-Object -First 1
+        if ($tool.ContainsKey('Confirm') -and
+            [Windows.MessageBox]::Show($window, $tool.Confirm, $tool.Name, 'YesNo', 'Warning') -ne 'Yes') { return }
         Start-TopDeckJob -Script 'param($id) Invoke-TopDeckTool -Id $id' -Argument $source.Tag -Status 'Running tool...'
     })
     [Windows.Controls.Grid]::SetColumn($run, 1)
@@ -261,12 +267,96 @@ foreach ($tool in $tools) {
 }
 $panels['Tools'] = $toolPanel
 
+# Cleanup tab: Scan fills in the sizes, then Clean removes the ticked items.
+$cleanPanel = New-CategoryPanel 'Cleanup'
+$cleanRows = [ordered]@{}   # cleanup ID -> @{ Item; Check; Size; Bytes }
+$bar = New-Object Windows.Controls.StackPanel
+$bar.Orientation = 'Horizontal'; $bar.Margin = '0,0,0,12'
+$btnScan = New-Object Windows.Controls.Button
+$btnScan.Content = 'Scan'; $btnScan.Margin = '0'
+$btnClean = New-Object Windows.Controls.Button
+$btnClean.Content = 'Clean selected'; $btnClean.Style = $window.FindResource('Primary'); $btnClean.IsEnabled = $false
+$cleanTotal = New-Object Windows.Controls.TextBlock
+$cleanTotal.Margin = '14,0,0,0'; $cleanTotal.VerticalAlignment = 'Center'; $cleanTotal.Foreground = New-Brush '#9AA3B2'
+$cleanTotal.Text = 'Not scanned yet.'
+[void]$bar.Children.Add($btnScan); [void]$bar.Children.Add($btnClean); [void]$bar.Children.Add($cleanTotal)
+[void]$cleanPanel.Children.Add($bar)
+
+foreach ($item in $cleanItems) {
+    $card = New-Card
+    $left = New-Object Windows.Controls.StackPanel
+    $line = New-Object Windows.Controls.StackPanel
+    $line.Orientation = 'Horizontal'
+    $name = New-Object Windows.Controls.TextBlock
+    $name.Text = $item.Name; $name.FontSize = 14; $name.FontWeight = 'SemiBold'
+    $size = New-Object Windows.Controls.TextBlock
+    $size.Margin = '10,0,0,0'; $size.VerticalAlignment = 'Center'; $size.Foreground = New-Brush '#F5B942'
+    [void]$line.Children.Add($name); [void]$line.Children.Add($size)
+    $desc = New-Object Windows.Controls.TextBlock
+    $desc.Text = $item.Description; $desc.TextWrapping = 'Wrap'; $desc.Foreground = New-Brush '#9AA3B2'; $desc.Margin = '0,4,20,0'
+    [void]$left.Children.Add($line); [void]$left.Children.Add($desc)
+    $check = New-Object Windows.Controls.CheckBox
+    $check.Style = $window.FindResource('Switch'); $check.VerticalAlignment = 'Center'
+    $check.IsChecked = [bool]$item.Selected
+    $check.Add_Click({ Update-CleanTotal })
+    [Windows.Controls.Grid]::SetColumn($check, 1)
+    [void]$card.Child.Children.Add($left); [void]$card.Child.Children.Add($check)
+    [void]$cleanPanel.Children.Add($card)
+    $cleanRows[$item.Id] = @{ Item = $item; Check = $check; Size = $size; Bytes = $null }
+    $searchIndex += , @{ Card = $card; Category = 'Cleanup'; Text = ('{0} {1}' -f $item.Name, $item.Description).ToLowerInvariant() }
+}
+$panels['Cleanup'] = $cleanPanel
+
+function Update-CleanTotal {
+    $picked = @($cleanRows.Values | Where-Object { $_.Check.IsChecked })
+    $scanned = @($picked | Where-Object { $null -ne $_.Bytes })
+    $bytes = [long]0
+    foreach ($r in $scanned) { $bytes += $r.Bytes }
+    $btnClean.IsEnabled = $picked.Count -gt 0 -and -not $script:job
+    $cleanTotal.Text = if (-not $picked.Count) { 'Nothing selected.' }
+        elseif ($scanned.Count) { "Selected: $(Format-TopDeckSize $bytes) in $($picked.Count) item(s)." }
+        else { "$($picked.Count) item(s) selected. Press Scan to see sizes." }
+}
+
+function Start-CleanupScan {
+    foreach ($r in $cleanRows.Values) { $r.Size.Text = 'scanning...' }
+    Start-TopDeckJob -Script 'Measure-TopDeckCleanup' -Status 'Scanning for files to clean...' -OnDone {
+        param($result)
+        $sizes = @($result | Where-Object { $_ -is [hashtable] }) | Select-Object -Last 1
+        foreach ($id in $cleanRows.Keys) {
+            $r = $cleanRows[$id]
+            if ($sizes -and $sizes.ContainsKey($id)) {
+                $r.Bytes = [long]$sizes[$id].Bytes
+                $r.Size.Text = '{0}  ({1:N0} files)' -f (Format-TopDeckSize $r.Bytes), [int]$sizes[$id].Files
+            } else { $r.Size.Text = '' }
+        }
+        Update-CleanTotal
+    }
+}
+
+$btnScan.Add_Click({ Start-CleanupScan })
+$btnClean.Add_Click({
+    $picked = @($cleanRows.Keys | Where-Object { $cleanRows[$_].Check.IsChecked })
+    if (-not $picked.Count) { return }
+    $names = ($picked | ForEach-Object { '  ' + $cleanRows[$_].Item.Name }) -join "`n"
+    $msg = "Permanently delete the files in:`n`n$names`n`nThis cannot be undone. Files in use are skipped."
+    if ([Windows.MessageBox]::Show($window, $msg, 'Clean up', 'YesNo', 'Warning') -ne 'Yes') { return }
+    Start-TopDeckJob -Script 'param($ids) Invoke-TopDeckCleanup -Id $ids' -Argument ([string[]]$picked) -Status 'Cleaning...' -OnDone {
+        param($result)
+        $freed = @($result | Where-Object { $_ -is [hashtable] }) | Select-Object -Last 1
+        $total = [long]0
+        if ($freed) { foreach ($v in $freed.Values) { $total += [long]$v.Bytes } }
+        Add-Log "Cleanup finished: freed $(Format-TopDeckSize $total) in total."
+        Start-CleanupScan
+    }
+})
+
 # All category panels live in one column; the tab list and the search box just show or hide them.
 $allPanel = New-Object Windows.Controls.StackPanel
 $ordered = @($categoryOrder | Where-Object { $panels.Contains($_) }) + @($panels.Keys | Where-Object { $categoryOrder -notcontains $_ })
 foreach ($c in $ordered) {
     [void]$allPanel.Children.Add($panels[$c])
-    $count = if ($c -eq 'Tools') { $tools.Count } else { @($tweaks | Where-Object { $_.Category -eq $c }).Count }
+    $count = if ($c -eq 'Tools') { $tools.Count } elseif ($c -eq 'Cleanup') { $cleanItems.Count } else { @($tweaks | Where-Object { $_.Category -eq $c }).Count }
     $item = New-Object Windows.Controls.ListBoxItem
     $item.Content = "$c  ($count)"; $item.Tag = $c
     [void]$ui.NavList.Items.Add($item)
@@ -306,6 +396,10 @@ $ui.NavList.Add_SelectionChanged({
     if ($script:navFromSearch -or -not $ui.NavList.SelectedItem) { return }
     if ($ui.SearchBox.Text) { $ui.SearchBox.Text = '' }
     Show-Category ([string]$ui.NavList.SelectedItem.Tag)
+    if ([string]$ui.NavList.SelectedItem.Tag -eq 'Cleanup' -and -not $script:cleanScanned -and -not $script:job) {
+        $script:cleanScanned = $true
+        Start-CleanupScan
+    }
 })
 $ui.SearchBox.Add_TextChanged({
     $text = $ui.SearchBox.Text.Trim()
@@ -487,7 +581,7 @@ $window.Add_Closing({
 
 #endregion
 
-$ui.HeaderSub.Text = "by Jenovaz  -  $($tweaks.Count) tweaks, $($tools.Count) tools  -  log: $env:ProgramData\TopDeckOptimizer\topdeck.log"
+$ui.HeaderSub.Text = "by Jenovaz  -  $($tweaks.Count) tweaks, $($cleanItems.Count) cleanup items, $($tools.Count) tools  -  log: $env:ProgramData\TopDeckOptimizer\topdeck.log"
 $window.Add_ContentRendered({ $timer.Start(); Update-State })
 [void]$window.ShowDialog()
 $timer.Stop()

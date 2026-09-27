@@ -16,9 +16,10 @@ It needs Windows 10 or 11. It uses Windows PowerShell 5.1, which is already buil
 - **Preview changes** lists every registry value, service and app that will be touched, with its current value and its new value.
 - Before a tweak is applied for the first time, its original settings are saved to `%ProgramData%\TopDeckOptimizer\backups.json`. Turning the switch off puts those originals back.
 - A Windows restore point is created before applying, unless you untick the box.
-- 189 tweaks across 11 tabs: Privacy, App Permissions, Debloat, Performance, Gaming, Start & Taskbar, File Explorer, Desktop & Look, Accessibility & Input, System and Security. Use the **Search** box to find one across all tabs.
+- 192 tweaks across 11 tabs: Privacy, App Permissions, Debloat, Performance, Gaming, Start & Taskbar, File Explorer, Desktop & Look, Accessibility & Input, System and Security. Use the **Search** box to find one across all tabs.
 - **Recommended** switches on the tweaks marked safe for most PCs. **Save profile** and **Load profile** carry your choices to another PC.
-- The **Tools** tab has one-off jobs: temp file cleanup, DISM and SFC repair, drive TRIM/defrag and DNS flush.
+- The **Cleanup** tab scans first and shows how much space each item holds: temp files, Windows Update cache, Delivery Optimization cache, crash dumps, thumbnails, shader caches, browser caches (not passwords or history) and the Recycle Bin. Tick what to remove, then Clean. It never follows folder links, so it can't reach outside the folders listed.
+- The **Tools** tab has one-off repair jobs: DISM and SFC, disk check, drive TRIM/defrag, old update cleanup, icon cache rebuild, Store cache reset, DNS flush, network reset and Windows Update reset. The last two ask before running.
 - Taskbar, Start and Explorer changes offer to restart File Explorer afterwards so they show straight away.
 - Everything is logged to `%ProgramData%\TopDeckOptimizer\topdeck.log`.
 
@@ -35,6 +36,7 @@ Risk labels:
 - **Removed apps** can't come back from a backup. Turning the switch off reinstalls the app from the Microsoft Store where possible, otherwise the log tells you to reinstall it by hand.
 - If you sign in as a standard user and type an admin password at the prompt, the "current user" settings apply to the admin account, not yours. Run it from an account that is itself an administrator.
 - The **Security** tab turns Windows protections off (UAC, Core Isolation). Those are Advanced and never switched on by Recommended.
+- **No registry cleaner**, on purpose. Deleting "orphaned" registry entries gives no measurable speed-up and is a common way to break apps.
 - `TopDeck.ps1 -Check` validates the tweak files and prints the state of every tweak without changing anything.
 
 ## Adding a tweak
@@ -73,6 +75,8 @@ Add `Explorer = $true` to a tweak if File Explorer needs restarting to show it. 
 pwsh -File Tests\FakeRegistry.Tests.ps1
 ```
 
+`Tests\Cleanup.Tests.ps1` builds a throw-away folder with links pointing outside it, recent files and read-only files, and checks the cleanup engine only deletes what it should.
+
 ## Layout
 
 ```
@@ -82,9 +86,10 @@ TopDeckOptimizer/
   Core/Engine.psm1         test / backup / apply / revert logic
   Core/MainWindow.xaml     window layout
   Tweaks/*.ps1             tweak definitions, one file per category
-  Tests/                   fake-registry test for every registry tweak
+  Tests/                   fake-registry test for every tweak, cleanup safety test
   PORTING.md               what was ported from ZOICWARE and Ultimate, bugs fixed, what was skipped and why
-  Tools/Tools.ps1          one-off tools
+  Tools/Tools.ps1          one-off repair tools
+  Tools/Cleanup.ps1        Cleanup tab categories
   THIRD-PARTY-NOTICES.txt  credits and licences
 ```
 

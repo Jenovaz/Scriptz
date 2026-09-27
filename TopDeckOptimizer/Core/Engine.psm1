@@ -665,6 +665,158 @@ function Invoke-TopDeckTool {
 
 #endregion
 
+#region Cleanup
+
+function Get-TopDeckCleanupItem {
+    <# Loads the cleanup categories from Tools\Cleanup.ps1. #>
+    param([string[]]$Id)
+    $all = @(& (Join-Path $script:Root 'Tools\Cleanup.ps1'))
+    if ($Id) { $all = @($all | Where-Object { $Id -contains $_.Id }) }
+    return $all
+}
+
+function Get-TopDeckSafeFile {
+    <#
+    Every file under a folder, without ever following a junction or symbolic link, so nothing
+    outside the folder can be reached. Folders that can't be read are skipped.
+    -MinAgeHours skips files changed more recently than that.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [double]$MinAgeHours = 0)
+    if (-not [IO.Directory]::Exists($Root)) { return }
+    $rootInfo = New-Object IO.DirectoryInfo $Root
+    if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) { return }
+    $cutoff = (Get-Date).AddHours(-$MinAgeHours)
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($rootInfo)
+    while ($stack.Count) {
+        $dir = $stack.Pop()
+        try { $entries = @($dir.GetFileSystemInfos()) } catch { continue }   # access denied: skip this folder
+        foreach ($e in $entries) {
+            if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($e -is [IO.DirectoryInfo]) { $stack.Push($e) }
+            elseif ($MinAgeHours -le 0 -or $e.LastWriteTime -lt $cutoff) { $e }
+        }
+    }
+}
+
+function Remove-TopDeckEmptyFolder {
+    # Deletes empty sub-folders under Root (never Root itself), deepest first. Links are left alone.
+    param([string]$Root)
+    if (-not [IO.Directory]::Exists($Root)) { return }
+    $dirs = New-Object System.Collections.Generic.List[IO.DirectoryInfo]
+    $stack = New-Object System.Collections.Stack
+    $stack.Push((New-Object IO.DirectoryInfo $Root))
+    while ($stack.Count) {
+        $d = $stack.Pop()
+        try { $subs = @($d.GetDirectories()) } catch { continue }
+        foreach ($sub in $subs) {
+            if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $dirs.Add($sub); $stack.Push($sub)
+        }
+    }
+    foreach ($d in ($dirs | Sort-Object { $_.FullName.Length } -Descending)) {
+        try { if (-not @($d.GetFileSystemInfos()).Count) { $d.Delete() } } catch { }   # in use or not empty: keep it
+    }
+}
+
+function Resolve-CleanupPath {
+    # Expands wildcards in folder/file paths; paths that don't exist are dropped.
+    param($Paths)
+    foreach ($p in @($Paths)) {
+        if (-not $p) { continue }
+        if ($p -match '[\*\?]') { Get-Item -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }
+        elseif (Test-Path -LiteralPath $p) { $p }
+    }
+}
+
+function Get-CleanupTarget {
+    # All files one category would delete: @{ Folders; Files }.
+    param([hashtable]$Item)
+    $age = if ($Item.ContainsKey('MinAgeHours')) { [double]$Item.MinAgeHours } else { 0 }
+    $folders = @(if ($Item.ContainsKey('Folders')) { Resolve-CleanupPath (& $Item.Folders) })
+    $files = @(foreach ($f in $folders) { Get-TopDeckSafeFile -Root $f -MinAgeHours $age })
+    if ($Item.ContainsKey('Files')) {
+        foreach ($p in Resolve-CleanupPath (& $Item.Files)) {
+            $fi = New-Object IO.FileInfo $p
+            if ($fi.Exists -and -not ($fi.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $files += $fi }
+        }
+    }
+    return @{ Folders = $folders; Files = $files }
+}
+
+function Measure-TopDeckCleanup {
+    <# Size of each category. Returns ID -> @{ Bytes; Files }. Plain data, safe to pass between threads. #>
+    param([string[]]$Id)
+    $result = @{}
+    foreach ($item in Get-TopDeckCleanupItem -Id $Id) {
+        try {
+            if ($item.ContainsKey('Measure')) { $result[$item.Id] = & $item.Measure; continue }
+            $t = Get-CleanupTarget $item
+            $bytes = [long]0
+            foreach ($f in $t.Files) { $bytes += $f.Length }
+            $result[$item.Id] = @{ Bytes = $bytes; Files = $t.Files.Count }
+        } catch {
+            Write-TopDeckLog "Could not scan $($item.Name): $($_.Exception.Message)" 'Warn'
+            $result[$item.Id] = @{ Bytes = [long]0; Files = 0 }
+        }
+    }
+    return $result
+}
+
+function Format-TopDeckSize {
+    param([double]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N1} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N0} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N0} KB' -f ($Bytes / 1KB) }
+    return "$([long]$Bytes) bytes"
+}
+
+function Invoke-TopDeckCleanup {
+    <#
+    Cleans the given categories. Files in use are skipped, not forced.
+    Returns ID -> @{ Bytes = freed; Files = deleted; Skipped = in use or protected }.
+    #>
+    param([Parameter(Mandatory)][string[]]$Id)
+    $result = @{}
+    foreach ($item in Get-TopDeckCleanupItem -Id $Id) {
+        Write-TopDeckLog "Cleaning: $($item.Name)"
+        $freed = [long]0; $deleted = 0; $skipped = 0
+        $state = $null
+        try {
+            if ($item.ContainsKey('Before')) { $state = & $item.Before }
+            if ($item.ContainsKey('Clean')) {
+                $before = & $item.Measure
+                & $item.Clean
+                $after = & $item.Measure
+                $freed = [long]$before.Bytes - [long]$after.Bytes
+                $deleted = [int]$before.Files - [int]$after.Files
+                $skipped = [int]$after.Files
+            } else {
+                $t = Get-CleanupTarget $item
+                foreach ($f in $t.Files) {
+                    try {
+                        $size = $f.Length
+                        if ($f.Attributes -band [IO.FileAttributes]::ReadOnly) { $f.Attributes = $f.Attributes -bxor [IO.FileAttributes]::ReadOnly }
+                        $f.Delete()
+                        $freed += $size; $deleted++
+                    } catch { $skipped++ }   # in use or protected: skip it
+                }
+                foreach ($folder in $t.Folders) { Remove-TopDeckEmptyFolder $folder }
+            }
+        } catch {
+            Write-TopDeckLog "  $($_.Exception.Message)" 'Error'
+        } finally {
+            if ($item.ContainsKey('After')) { try { & $item.After $state } catch { Write-TopDeckLog "  $($_.Exception.Message)" 'Warn' } }
+        }
+        $note = if ($skipped) { ", $skipped in use and skipped" } else { '' }
+        Write-TopDeckLog ("  freed {0} ({1} files{2})" -f (Format-TopDeckSize $freed), $deleted, $note) 'Ok'
+        $result[$item.Id] = @{ Bytes = $freed; Files = $deleted; Skipped = $skipped }
+    }
+    return $result
+}
+
+#endregion
+
 #region Restore point and profiles
 
 function New-TopDeckRestorePoint {
@@ -710,4 +862,5 @@ function Import-TopDeckProfile {
 
 Export-ModuleMember -Function Set-TopDeckLogSink, Write-TopDeckLog, Get-TopDeckTweak, Get-TopDeckTool,
     Test-TopDeckDefinition, Get-TopDeckTweakState, Get-TopDeckState, Get-TopDeckPreview, Invoke-TopDeckPlan,
-    Invoke-TopDeckTool, Restart-TopDeckExplorer, New-TopDeckRestorePoint, Export-TopDeckProfile, Import-TopDeckProfile, Read-TopDeckBackup
+    Invoke-TopDeckTool, Restart-TopDeckExplorer, Get-TopDeckCleanupItem, Get-TopDeckSafeFile, Measure-TopDeckCleanup,
+    Invoke-TopDeckCleanup, Format-TopDeckSize, New-TopDeckRestorePoint, Export-TopDeckProfile, Import-TopDeckProfile, Read-TopDeckBackup
